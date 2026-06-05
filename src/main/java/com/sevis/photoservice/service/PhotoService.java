@@ -4,6 +4,7 @@ import com.sevis.photoservice.dto.response.PhotoResponse;
 import com.sevis.photoservice.dto.response.PhotosByDateResponse;
 import com.sevis.photoservice.model.Photo;
 import com.sevis.photoservice.model.PhotoFolder;
+import com.sevis.photoservice.repository.PhotoAlbumRepository;
 import com.sevis.photoservice.repository.PhotoRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
@@ -27,6 +28,7 @@ import java.util.stream.Collectors;
 public class PhotoService {
 
     private final PhotoRepository photoRepository;
+    private final PhotoAlbumRepository photoAlbumRepository;
     private final FolderService folderService;
 
     public PhotoResponse upload(Long userId, String folderPassword, MultipartFile file) {
@@ -110,7 +112,21 @@ public class PhotoService {
         } catch (IOException e) {
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to delete file");
         }
+        photoAlbumRepository.deleteByPhotoId(photoId);
         photoRepository.deleteByIdAndUserId(photoId, userId);
+    }
+
+    @Transactional
+    public void bulkDelete(Long userId, List<Long> photoIds, String folderPassword) {
+        PhotoFolder folder = folderService.verifyAndGetFolder(userId, folderPassword);
+        for (Long photoId : photoIds) {
+            photoRepository.findByIdAndUserId(photoId, userId).ifPresent(photo -> {
+                Path filePath = Path.of(folder.getFolderPath(), photo.getStoredFilename());
+                try { Files.deleteIfExists(filePath); } catch (IOException ignored) {}
+                photoAlbumRepository.deleteByPhotoId(photoId);
+                photoRepository.deleteByIdAndUserId(photoId, userId);
+            });
+        }
     }
 
     private PhotoResponse toResponse(Photo photo) {

@@ -1,5 +1,6 @@
 package com.sevis.photoservice.controller;
 
+import com.sevis.photoservice.dto.request.BulkDeleteRequest;
 import com.sevis.photoservice.dto.response.PhotoResponse;
 import com.sevis.photoservice.dto.response.PhotosByDateResponse;
 import com.sevis.photoservice.service.PhotoService;
@@ -44,6 +45,15 @@ public class PhotoController {
         return ResponseEntity.ok()
                 .contentType(MediaType.parseMediaType(contentType))
                 .body(content);
+    }
+
+    @DeleteMapping("/bulk")
+    public ResponseEntity<Map<String, String>> bulkDelete(
+            @RequestHeader("X-User-Id") Long userId,
+            @RequestHeader("X-Folder-Password") String folderPassword,
+            @RequestBody BulkDeleteRequest request) {
+        photoService.bulkDelete(userId, request.getPhotoIds(), folderPassword);
+        return ResponseEntity.ok(Map.of("message", "Photos deleted"));
     }
 
     @DeleteMapping("/{id}")
