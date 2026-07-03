@@ -24,8 +24,10 @@ spring:
         dialect: org.hibernate.dialect.MySQLDialect
   servlet:
     multipart:
-      max-file-size: 20MB
-      max-request-size: 25MB
+      # Raised from 20MB/25MB to accommodate video uploads forwarded to stream-service;
+      # photo uploads are unaffected by a higher ceiling.
+      max-file-size: 2GB
+      max-request-size: 2GB
 
 eureka:
   client:
@@ -46,3 +48,10 @@ management:
     web:
       exposure:
         include: health,info
+
+logging:
+  level:
+    root: INFO
+    com.sevis: DEBUG
+  file:
+    name: /home/sevis/projects/local-logs/photo-service.log

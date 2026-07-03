@@ -5,9 +5,14 @@ import com.sevis.photoservice.dto.response.PhotoResponse;
 import com.sevis.photoservice.dto.response.PhotosByDateResponse;
 import com.sevis.photoservice.service.PhotoService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
@@ -42,8 +47,10 @@ public class PhotoController {
             @PathVariable Long id) {
         byte[] content = photoService.getPhotoContent(userId, id, folderPassword);
         String contentType = photoService.getContentType(userId, id);
+        // private: browser may cache, proxies must not — photo is user-specific and auth-gated
         return ResponseEntity.ok()
                 .contentType(MediaType.parseMediaType(contentType))
+                .cacheControl(CacheControl.maxAge(7, TimeUnit.DAYS).cachePrivate())
                 .body(content);
     }
 

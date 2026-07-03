@@ -21,6 +21,7 @@ public class FolderService {
 
     private final PhotoFolderRepository folderRepository;
     private final PasswordEncoder passwordEncoder;
+    private final EncryptionService encryptionService;
 
     @Value("${photo.storage.base-dir}")
     private String baseDir;
@@ -47,6 +48,8 @@ public class FolderService {
             PhotoFolder newFolder = new PhotoFolder();
             newFolder.setUserId(userId);
             newFolder.setPasswordHash(passwordEncoder.encode(request.getPassword()));
+            newFolder.setEncryptionSalt(encryptionService.generateSaltHex());
+            newFolder.setPbkdf2Iterations(EncryptionService.DEFAULT_PBKDF2_ITERS);
             newFolder.setFolderPath(folderPath);
             folderRepository.save(newFolder);
         }
@@ -65,6 +68,14 @@ public class FolderService {
         if (!passwordEncoder.matches(password, folder.getPasswordHash())) {
             throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Incorrect folder password");
         }
+
+        // Backfill for folders created before encryption was introduced
+        if (folder.getEncryptionSalt() == null || folder.getEncryptionSalt().isBlank()) {
+            folder.setEncryptionSalt(encryptionService.generateSaltHex());
+            folder.setPbkdf2Iterations(EncryptionService.DEFAULT_PBKDF2_ITERS);
+            folderRepository.save(folder);
+        }
+
         return folder;
     }
 

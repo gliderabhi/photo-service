@@ -30,6 +30,7 @@ public class PhotoService {
     private final PhotoRepository photoRepository;
     private final PhotoAlbumRepository photoAlbumRepository;
     private final FolderService folderService;
+    private final EncryptionService encryptionService;
 
     public PhotoResponse upload(Long userId, String folderPassword, MultipartFile file) {
         PhotoFolder folder = folderService.verifyAndGetFolder(userId, folderPassword);
@@ -41,7 +42,8 @@ public class PhotoService {
         Path targetPath = Path.of(folder.getFolderPath(), storedName);
         try {
             Files.createDirectories(targetPath.getParent());
-            file.transferTo(targetPath);
+            byte[] encrypted = encryptionService.encrypt(file.getBytes(), folderPassword, folder.getEncryptionSalt(), folder.getPbkdf2Iterations());
+            Files.write(targetPath, encrypted);
         } catch (IOException e) {
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to save file");
         }
@@ -87,7 +89,8 @@ public class PhotoService {
 
         Path filePath = Path.of(folder.getFolderPath(), photo.getStoredFilename());
         try {
-            return Files.readAllBytes(filePath);
+            byte[] encrypted = Files.readAllBytes(filePath);
+            return encryptionService.decrypt(encrypted, folderPassword, folder.getEncryptionSalt(), folder.getPbkdf2Iterations());
         } catch (IOException e) {
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to read photo");
         }

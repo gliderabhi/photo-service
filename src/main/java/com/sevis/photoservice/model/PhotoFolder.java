@@ -19,6 +19,14 @@ public class PhotoFolder {
     @Column(nullable = false)
     private String passwordHash;
 
+    /** Random salt used for PBKDF2 AES key derivation; hex-encoded, generated once at setup */
+    @Column(nullable = false, length = 64)
+    private String encryptionSalt;
+
+    /** PBKDF2 iteration count used when this folder's key was first derived — never change after creation */
+    @Column(nullable = false)
+    private int pbkdf2Iterations = 120_000;
+
     /** Absolute path on disk where this user's photos are stored */
     @Column(nullable = false)
     private String folderPath;
