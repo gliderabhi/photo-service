@@ -16,7 +16,10 @@ import org.springframework.web.server.ResponseStatusException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.LocalDate;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -35,6 +38,22 @@ public class PhotoService {
     public PhotoResponse upload(Long userId, String folderPassword, MultipartFile file) {
         PhotoFolder folder = folderService.verifyAndGetFolder(userId, folderPassword);
 
+        byte[] rawBytes;
+        try {
+            rawBytes = file.getBytes();
+        } catch (IOException e) {
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to read upload");
+        }
+
+        // Hash the plaintext bytes, not the on-disk ciphertext — encryption uses
+        // a fresh IV/salt per write, so identical plaintext never produces the
+        // same ciphertext to compare against.
+        String hash = sha256Hex(rawBytes);
+        var existing = photoRepository.findByUserIdAndContentHash(userId, hash);
+        if (existing.isPresent()) {
+            return toResponse(existing.get());
+        }
+
         String originalName = file.getOriginalFilename();
         String extension = extractExtension(originalName);
         String storedName = UUID.randomUUID() + extension;
@@ -42,7 +61,7 @@ public class PhotoService {
         Path targetPath = Path.of(folder.getFolderPath(), storedName);
         try {
             Files.createDirectories(targetPath.getParent());
-            byte[] encrypted = encryptionService.encrypt(file.getBytes(), folderPassword, folder.getEncryptionSalt(), folder.getPbkdf2Iterations());
+            byte[] encrypted = encryptionService.encrypt(rawBytes, folderPassword, folder.getEncryptionSalt(), folder.getPbkdf2Iterations());
             Files.write(targetPath, encrypted);
         } catch (IOException e) {
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to save file");
@@ -54,9 +73,19 @@ public class PhotoService {
         photo.setOriginalFilename(originalName != null ? originalName : storedName);
         photo.setContentType(file.getContentType());
         photo.setFileSize(file.getSize());
+        photo.setContentHash(hash);
         photoRepository.save(photo);
 
         return toResponse(photo);
+    }
+
+    private static String sha256Hex(byte[] data) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(data));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
     }
 
     public List<PhotosByDateResponse> listGroupedByDate(Long userId, String folderPassword) {

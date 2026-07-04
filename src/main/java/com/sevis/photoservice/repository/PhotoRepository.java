@@ -12,5 +12,7 @@ public interface PhotoRepository extends JpaRepository<Photo, Long> {
 
     Optional<Photo> findByIdAndUserId(Long id, Long userId);
 
+    Optional<Photo> findByUserIdAndContentHash(Long userId, String contentHash);
+
     void deleteByIdAndUserId(Long id, Long userId);
 }

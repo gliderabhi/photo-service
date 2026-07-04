@@ -32,6 +32,12 @@ public class Photo {
 
     private Long fileSize;
 
+    /** SHA-256 of the original (pre-encryption) file bytes, used to reject
+     *  re-uploads of a file already in this user's folder. Nullable so
+     *  existing rows predating this field don't need a backfill. */
+    @Column(length = 64)
+    private String contentHash;
+
     @Column(nullable = false)
     private LocalDateTime uploadedAt;
 
