@@ -7,6 +7,11 @@ import com.sevis.photoservice.model.PhotoFolder;
 import com.sevis.photoservice.repository.PhotoAlbumRepository;
 import com.sevis.photoservice.repository.PhotoRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -35,6 +40,18 @@ public class PhotoService {
     private final FolderService folderService;
     private final EncryptionService encryptionService;
 
+    // Self-injected proxy so the @Cacheable data-fetch method below runs
+    // through Spring's caching interceptor when invoked from listGroupedByDate
+    // in this same class (plain self-invocation bypasses the proxy). @Lazy
+    // avoids a circular construction dependency.
+    @Autowired
+    @Lazy
+    private PhotoService self;
+
+    // A fresh upload doesn't touch album listings/covers directly (that only
+    // happens via AlbumService.addPhotos), so only the date-grouped listing
+    // needs invalidating here.
+    @CacheEvict(value = "photosByDate", key = "#userId")
     public PhotoResponse upload(Long userId, String folderPassword, MultipartFile file) {
         PhotoFolder folder = folderService.verifyAndGetFolder(userId, folderPassword);
 
@@ -88,9 +105,15 @@ public class PhotoService {
         }
     }
 
+    // Password verification (a security check) must run on every call and
+    // must never itself be cached — only the pure data fetch below is.
     public List<PhotosByDateResponse> listGroupedByDate(Long userId, String folderPassword) {
         folderService.verifyAndGetFolder(userId, folderPassword);
+        return self.getPhotosByDateCached(userId);
+    }
 
+    @Cacheable(value = "photosByDate", key = "#userId", sync = true)
+    public List<PhotosByDateResponse> getPhotosByDateCached(Long userId) {
         List<Photo> photos = photoRepository.findByUserIdOrderByUploadedAtDesc(userId);
 
         Map<LocalDate, List<Photo>> grouped = photos.stream()
@@ -131,7 +154,16 @@ public class PhotoService {
         return photo.getContentType() != null ? photo.getContentType() : "application/octet-stream";
     }
 
+    // Deleting a photo may remove it from any number of albums
+    // (photoAlbumRepository.deleteByPhotoId below) and we don't know which
+    // albums were affected here, so albumPhotos is evicted wholesale rather
+    // than trying to compute the precise album keys — correctness over hit-rate.
     @Transactional
+    @Caching(evict = {
+            @CacheEvict(value = "photosByDate", key = "#userId"),
+            @CacheEvict(value = "albumsByUser", key = "#userId"),
+            @CacheEvict(value = "albumPhotos", allEntries = true)
+    })
     public void delete(Long userId, Long photoId, String folderPassword) {
         PhotoFolder folder = folderService.verifyAndGetFolder(userId, folderPassword);
 
@@ -148,7 +180,14 @@ public class PhotoService {
         photoRepository.deleteByIdAndUserId(photoId, userId);
     }
 
+    // Same reasoning as delete() above — any of the deleted photos could have
+    // belonged to any album, so albumPhotos is evicted wholesale.
     @Transactional
+    @Caching(evict = {
+            @CacheEvict(value = "photosByDate", key = "#userId"),
+            @CacheEvict(value = "albumsByUser", key = "#userId"),
+            @CacheEvict(value = "albumPhotos", allEntries = true)
+    })
     public void bulkDelete(Long userId, List<Long> photoIds, String folderPassword) {
         PhotoFolder folder = folderService.verifyAndGetFolder(userId, folderPassword);
         for (Long photoId : photoIds) {

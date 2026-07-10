@@ -5,6 +5,8 @@ import com.sevis.photoservice.model.PhotoFolder;
 import com.sevis.photoservice.repository.PhotoFolderRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -26,6 +28,11 @@ public class FolderService {
     @Value("${photo.storage.base-dir}")
     private String baseDir;
 
+    // Evicts unconditionally: covers both the "folder didn't exist -> now
+    // exists" transition (which flips the cached hasFolder result) and a
+    // plain password rotation (which doesn't change hasFolder but is cheap
+    // to evict anyway — correctness over hit-rate).
+    @CacheEvict(value = "folderStatus", key = "#userId")
     public void setupFolder(Long userId, FolderSetupRequest request) {
         if (request.getPassword() == null || request.getPassword().isBlank()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Password must not be blank");
@@ -55,11 +62,20 @@ public class FolderService {
         }
     }
 
+    // Pure existence check, no password involved — safe to cache directly.
+    @Cacheable(value = "folderStatus", key = "#userId", sync = true)
     public boolean hasFolder(Long userId) {
         return folderRepository.findByUserId(userId).isPresent();
     }
 
-    /** Verifies the folder password and returns the folder entity if valid. */
+    /**
+     * Verifies the folder password and returns the folder entity if valid.
+     * This is a security check (throws on bad/missing password) — it must
+     * NEVER be cached, otherwise a wrong password could be silently accepted
+     * once a prior successful verification for the same key was cached. It
+     * also has a side effect (encryption-salt backfill save), another reason
+     * it can't be a cached read.
+     */
     public PhotoFolder verifyAndGetFolder(Long userId, String password) {
         PhotoFolder folder = folderRepository.findByUserId(userId)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
