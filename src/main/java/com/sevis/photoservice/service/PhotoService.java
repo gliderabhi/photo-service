@@ -39,6 +39,7 @@ public class PhotoService {
     private final PhotoAlbumRepository photoAlbumRepository;
     private final FolderService folderService;
     private final EncryptionService encryptionService;
+    private final FaceService faceService;
 
     // Self-injected proxy so the @Cacheable data-fetch method below runs
     // through Spring's caching interceptor when invoked from listGroupedByDate
@@ -92,6 +93,13 @@ public class PhotoService {
         photo.setFileSize(file.getSize());
         photo.setContentHash(hash);
         photoRepository.save(photo);
+
+        // Fire-and-forget: face detection runs on face-service against the
+        // plaintext bytes still in hand here — this is the only point they
+        // exist outside the encrypted-at-rest file, since they're about to go
+        // out of scope. Runs async so a slow/unavailable face-service never
+        // delays the upload response.
+        faceService.detectAndStoreAsync(userId, photo.getId(), rawBytes, originalName);
 
         return toResponse(photo);
     }
@@ -177,6 +185,7 @@ public class PhotoService {
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to delete file");
         }
         photoAlbumRepository.deleteByPhotoId(photoId);
+        faceService.deleteFacesForPhoto(photoId);
         photoRepository.deleteByIdAndUserId(photoId, userId);
     }
 
@@ -195,6 +204,7 @@ public class PhotoService {
                 Path filePath = Path.of(folder.getFolderPath(), photo.getStoredFilename());
                 try { Files.deleteIfExists(filePath); } catch (IOException ignored) {}
                 photoAlbumRepository.deleteByPhotoId(photoId);
+                faceService.deleteFacesForPhoto(photoId);
                 photoRepository.deleteByIdAndUserId(photoId, userId);
             });
         }

@@ -43,6 +43,10 @@ photo:
   storage:
     base-dir: /mnt/sdb1/photos
 
+face:
+  service:
+    url: http://localhost:8600
+
 management:
   endpoints:
     web:
