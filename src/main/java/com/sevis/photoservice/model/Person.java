@@ -27,10 +27,13 @@ public class Person {
     /** Null until the user names this person. */
     private String label;
 
-    /** Running-average embedding of every Face assigned to this person, comma-separated doubles. */
-    @Column(nullable = false, columnDefinition = "TEXT")
-    private String centroidEmbedding;
-
+    // No stored centroid: matching a new face against a person compares it
+    // against every one of that person's own stored Face embeddings (capped —
+    // see FaceService.MAX_EXEMPLARS_PER_PERSON), not a single blended-average
+    // vector. A running-average centroid drifts as more angles/lighting get
+    // folded in, which was causing the same person to intermittently miss
+    // its own match and get split into a new Person — exemplar matching
+    // doesn't have that failure mode.
     @Column(nullable = false)
     private Integer faceCount;
 

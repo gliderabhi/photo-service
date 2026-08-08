@@ -28,7 +28,9 @@ import org.springframework.web.client.RestTemplate;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
@@ -36,20 +38,34 @@ import java.util.stream.Collectors;
  * bytes PhotoService.upload() has in hand right before it encrypts them to
  * disk — face-service never sees encrypted bytes or the folder password.
  *
- * Clustering is a simple incremental nearest-centroid match against this
- * user's existing Person rows (small N — personal-scale library, brute force
- * is plenty fast). No naming/identity is inferred; the user labels people
- * manually via renamePerson().
+ * Clustering matches a new face against every one of a person's existing
+ * stored faces (capped per person, see MAX_EXEMPLARS_PER_PERSON) and takes
+ * the best of those — not a single blended centroid. A centroid drifts
+ * towards the "average" of every angle/lighting/expression folded into it,
+ * which in practice made the same real person's later photos fall outside
+ * the match threshold and get split off as a new Person; matching against
+ * the individual exemplars doesn't have that failure mode. Mirrors the
+ * approach the app's previous on-device implementation used, ported here now
+ * that detection itself is server-side. No naming/identity is inferred; the
+ * user labels people manually via renamePerson().
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class FaceService {
 
-    // face_recognition's own convention for "same person" is a Euclidean
-    // distance of 0.6 on its 128-d encodings; clustering is stricter than
-    // matching to keep person groups clean rather than merge lookalikes.
-    private static final double CLUSTER_DISTANCE_THRESHOLD = 0.5;
+    // face_recognition's own published match threshold for its 128-d
+    // encodings (Euclidean distance) — not tuned against this app's library,
+    // but the right starting point since face-service uses that same model.
+    private static final double CLUSTER_DISTANCE_THRESHOLD = 0.6;
+
+    // Bounds how many of a person's stored faces a new face gets compared
+    // against. Without this, a person's cluster keeps gaining more chances at
+    // a spurious high-similarity hit purely from face count as it grows, not
+    // genuine resemblance — classic extreme-value inflation in a "best of N
+    // comparisons" scheme. Also keeps per-upload matching cost bounded
+    // regardless of how large one person's cluster or the library gets.
+    private static final int MAX_EXEMPLARS_PER_PERSON = 50;
 
     private final FaceRepository faceRepository;
     private final PersonRepository personRepository;
@@ -65,6 +81,12 @@ public class FaceService {
             FaceServiceDetectResponse detection = callFaceService(imageBytes, originalFilename);
             if (detection == null || detection.getFaces() == null || detection.getFaces().isEmpty()) return;
 
+            // Every existing exemplar for this user, grouped by person and capped
+            // per person — loaded once per photo (not once per face) and appended
+            // to in-memory as faces in *this* photo get assigned, so multiple faces
+            // of the same person within one photo still cluster together correctly.
+            Map<Long, List<double[]>> exemplars = loadExemplars(userId);
+
             for (FaceServiceDetectResponse.DetectedFace detected : detection.getFaces()) {
                 double[] embedding = detected.getEmbedding().stream().mapToDouble(Double::doubleValue).toArray();
 
@@ -77,7 +99,7 @@ public class FaceService {
                 face.setBoxRight(detected.getBox().getRight() / (double) detection.getImageWidth());
                 face.setEmbedding(joinEmbedding(embedding));
 
-                Person person = assignPerson(userId, embedding);
+                Person person = assignPerson(userId, embedding, exemplars);
                 face.setPersonId(person.getId());
                 faceRepository.save(face);
 
@@ -91,6 +113,17 @@ public class FaceService {
             // as an upload failure to the user — the photo itself already saved fine.
             log.warn("Face detection failed for photo {}: {}", photoId, e.getMessage());
         }
+    }
+
+    private Map<Long, List<double[]>> loadExemplars(Long userId) {
+        Map<Long, List<double[]>> exemplars = new HashMap<>();
+        for (Face face : faceRepository.findByUserIdAndPersonIdIsNotNull(userId)) {
+            List<double[]> personExemplars = exemplars.computeIfAbsent(face.getPersonId(), k -> new ArrayList<>());
+            if (personExemplars.size() < MAX_EXEMPLARS_PER_PERSON) {
+                personExemplars.add(parseEmbedding(face.getEmbedding()));
+            }
+        }
+        return exemplars;
     }
 
     private FaceServiceDetectResponse callFaceService(byte[] imageBytes, String filename) {
@@ -111,38 +144,43 @@ public class FaceService {
     // class, so a self-invoked annotation would silently no-op (same proxy
     // caveat as PhotoService's @Cacheable self-injection). Each repository
     // save() below is already transactional on its own; a non-atomic
-    // read-then-write pair across two saves here is an acceptable tradeoff for
-    // best-effort clustering, not a correctness risk for photo data itself.
-    private Person assignPerson(Long userId, double[] embedding) {
-        List<Person> candidates = personRepository.findByUserId(userId);
-
-        Person best = null;
+    // read-then-write pair here is an acceptable tradeoff for best-effort
+    // clustering, not a correctness risk for photo data itself.
+    private Person assignPerson(Long userId, double[] embedding, Map<Long, List<double[]>> exemplars) {
+        // Best match is whichever person has the single closest exemplar among
+        // their stored faces — not whichever person's *average* is closest, which
+        // is what makes this robust to one person having very different-looking
+        // exemplars (angle/lighting/expression) rather than one blurry average.
+        Long bestPersonId = null;
         double bestDistance = Double.MAX_VALUE;
-        for (Person candidate : candidates) {
-            double distance = euclideanDistance(embedding, parseEmbedding(candidate.getCentroidEmbedding()));
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                best = candidate;
+        for (Map.Entry<Long, List<double[]>> entry : exemplars.entrySet()) {
+            for (double[] exemplar : entry.getValue()) {
+                double distance = euclideanDistance(embedding, exemplar);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestPersonId = entry.getKey();
+                }
             }
         }
 
-        if (best != null && bestDistance < CLUSTER_DISTANCE_THRESHOLD) {
-            double[] centroid = parseEmbedding(best.getCentroidEmbedding());
-            int n = best.getFaceCount();
-            double[] updated = new double[centroid.length];
-            for (int i = 0; i < centroid.length; i++) {
-                updated[i] = (centroid[i] * n + embedding[i]) / (n + 1);
-            }
-            best.setCentroidEmbedding(joinEmbedding(updated));
-            best.setFaceCount(n + 1);
-            return personRepository.save(best);
+        if (bestPersonId != null && bestDistance < CLUSTER_DISTANCE_THRESHOLD) {
+            final Long matchedPersonId = bestPersonId;
+            Person person = personRepository.findByIdAndUserId(matchedPersonId, userId)
+                    .orElseThrow(() -> new IllegalStateException("Person " + matchedPersonId + " vanished mid-detection"));
+            person.setFaceCount(person.getFaceCount() + 1);
+            personRepository.save(person);
+
+            List<double[]> personExemplars = exemplars.computeIfAbsent(matchedPersonId, k -> new ArrayList<>());
+            if (personExemplars.size() < MAX_EXEMPLARS_PER_PERSON) personExemplars.add(embedding);
+            return person;
         }
 
         Person person = new Person();
         person.setUserId(userId);
-        person.setCentroidEmbedding(joinEmbedding(embedding));
         person.setFaceCount(1);
-        return personRepository.save(person);
+        person = personRepository.save(person);
+        exemplars.put(person.getId(), new ArrayList<>(List.of(embedding)));
+        return person;
     }
 
     public List<FaceResponse> facesForPhoto(Long userId, Long photoId) {
