@@ -7,12 +7,14 @@ import com.sevis.photoservice.model.PhotoFolder;
 import com.sevis.photoservice.repository.PhotoAlbumRepository;
 import com.sevis.photoservice.repository.PhotoRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.cache.annotation.Caching;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.http.HttpStatus;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
@@ -37,6 +39,7 @@ import java.util.TreeMap;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class PhotoService {
@@ -196,6 +199,39 @@ public class PhotoService {
         } catch (IOException e) {
             return full;
         }
+    }
+
+    /**
+     * One-time (well, re-runnable) catch-up for photos uploaded before server-side
+     * face detection existed, or from any period face-service was down — detection
+     * normally only ever runs once, at upload time (see upload() above), so nothing
+     * retroactively scans photos that predate it. Runs on the same small background
+     * executor uploads use, sequentially (not fanned out per-photo), so it never
+     * competes with — or gets starved by — live upload traffic, and a personal
+     * library's worth of photos finishes in a reasonable time without needing its
+     * own dedicated thread pool.
+     */
+    @Async("faceDetectionExecutor")
+    public void backfillFaces(Long userId, String folderPassword) {
+        PhotoFolder folder = folderService.verifyAndGetFolder(userId, folderPassword);
+        java.util.Set<Long> alreadyScanned = faceService.photoIdsWithFaces(userId);
+        List<Photo> photos = photoRepository.findByUserIdOrderByUploadedAtDesc(userId);
+
+        int scanned = 0;
+        for (Photo photo : photos) {
+            if (alreadyScanned.contains(photo.getId())) continue;
+            try {
+                Path filePath = Path.of(folder.getFolderPath(), photo.getStoredFilename());
+                byte[] encrypted = Files.readAllBytes(filePath);
+                byte[] plain = encryptionService.decrypt(encrypted, folderPassword, folder.getEncryptionSalt(), folder.getPbkdf2Iterations());
+                faceService.detectAndStoreSync(userId, photo.getId(), plain, photo.getOriginalFilename());
+                scanned++;
+            } catch (Exception e) {
+                log.warn("Face backfill failed for photo {}: {}", photo.getId(), e.getMessage());
+            }
+        }
+        log.info("Face backfill finished for user {}: scanned {} new photo(s) ({} already had results)",
+                userId, scanned, alreadyScanned.size());
     }
 
     public String getContentType(Long userId, Long photoId) {

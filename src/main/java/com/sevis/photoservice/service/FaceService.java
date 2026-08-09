@@ -77,6 +77,18 @@ public class FaceService {
 
     @Async("faceDetectionExecutor")
     public void detectAndStoreAsync(Long userId, Long photoId, byte[] imageBytes, String originalFilename) {
+        detectAndStoreSync(userId, photoId, imageBytes, originalFilename);
+    }
+
+    // Synchronous core, reused by both the per-upload @Async path above and
+    // PhotoService.backfillFaces() below (itself already running on its own
+    // background thread, so this doesn't need its own @Async wrapper — a nested
+    // one would just queue onto the same small executor pool for no benefit).
+    // Reloads exemplars fresh on every call rather than sharing a running set
+    // across a whole backfill batch — one extra query per photo, negligible at
+    // a personal-library scale, and far simpler than threading shared mutable
+    // clustering state between two services.
+    public void detectAndStoreSync(Long userId, Long photoId, byte[] imageBytes, String originalFilename) {
         try {
             FaceServiceDetectResponse detection = callFaceService(imageBytes, originalFilename);
             if (detection == null || detection.getFaces() == null || detection.getFaces().isEmpty()) return;
@@ -113,6 +125,13 @@ public class FaceService {
             // as an upload failure to the user — the photo itself already saved fine.
             log.warn("Face detection failed for photo {}: {}", photoId, e.getMessage());
         }
+    }
+
+    /** Photo ids that already have at least one detection attempt recorded for this
+     *  user — PhotoService.backfillFaces() skips these so re-running the backfill
+     *  after new photos arrive doesn't re-scan everything from scratch. */
+    public java.util.Set<Long> photoIdsWithFaces(Long userId) {
+        return faceRepository.findByUserId(userId).stream().map(Face::getPhotoId).collect(java.util.stream.Collectors.toSet());
     }
 
     private Map<Long, List<double[]>> loadExemplars(Long userId) {

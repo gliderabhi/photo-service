@@ -5,11 +5,13 @@ import com.sevis.photoservice.dto.response.FaceResponse;
 import com.sevis.photoservice.dto.response.PersonResponse;
 import com.sevis.photoservice.dto.response.PhotoResponse;
 import com.sevis.photoservice.service.FaceService;
+import com.sevis.photoservice.service.PhotoService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * Read side of server-side face detection (see FaceService for the write
@@ -23,6 +25,7 @@ import java.util.List;
 public class FaceController {
 
     private final FaceService faceService;
+    private final PhotoService photoService;
 
     @GetMapping("/{photoId}/faces")
     public ResponseEntity<List<FaceResponse>> facesForPhoto(
@@ -49,5 +52,16 @@ public class FaceController {
             @PathVariable Long personId,
             @RequestBody RenamePersonRequest request) {
         return ResponseEntity.ok(faceService.renamePerson(userId, personId, request));
+    }
+
+    // Fire-and-forget: runs on photo-service's own background executor (see
+    // PhotoService#backfillFaces) and can take a while for a large library, so this
+    // returns immediately rather than making the caller wait for the whole scan.
+    @PostMapping("/faces/backfill")
+    public ResponseEntity<Map<String, String>> backfillFaces(
+            @RequestHeader("X-User-Id") Long userId,
+            @RequestHeader("X-Folder-Password") String folderPassword) {
+        photoService.backfillFaces(userId, folderPassword);
+        return ResponseEntity.accepted().body(Map.of("message", "Face scan started in the background"));
     }
 }
