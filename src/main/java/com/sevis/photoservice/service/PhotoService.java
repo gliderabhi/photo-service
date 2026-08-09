@@ -18,9 +18,15 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import javax.imageio.ImageIO;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.LocalDate;
@@ -153,6 +159,42 @@ public class PhotoService {
             return encryptionService.decrypt(encrypted, folderPassword, folder.getEncryptionSalt(), folder.getPbkdf2Iterations());
         } catch (IOException e) {
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to read photo");
+        }
+    }
+
+    // Not cached (see CacheConfig) — recomputed on every request the same way
+    // getPhotoContent already is, just on a much smaller output. Falls back to the
+    // full-size original if the source can't be decoded as a raster image (e.g. a
+    // HEIC upload — the JDK's bundled ImageIO has no HEIC reader without an extra
+    // native plugin dependency this service doesn't carry), so a thumbnail request
+    // never hard-fails, just loses the size win for that one format.
+    public byte[] getPhotoThumbnail(Long userId, Long photoId, String folderPassword, int maxDimension) {
+        byte[] full = getPhotoContent(userId, photoId, folderPassword);
+        try {
+            BufferedImage source = ImageIO.read(new ByteArrayInputStream(full));
+            if (source == null) return full;
+
+            int width = source.getWidth();
+            int height = source.getHeight();
+            double scale = Math.min(1.0, (double) maxDimension / Math.max(width, height));
+            if (scale >= 1.0) return full; // already smaller than the requested thumbnail
+            int targetWidth = Math.max(1, (int) Math.round(width * scale));
+            int targetHeight = Math.max(1, (int) Math.round(height * scale));
+
+            BufferedImage resized = new BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_RGB);
+            Graphics2D g = resized.createGraphics();
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+            g.drawImage(source, 0, 0, targetWidth, targetHeight, null);
+            g.dispose();
+            source.flush();
+
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            ImageIO.write(resized, "jpg", out);
+            resized.flush();
+            return out.toByteArray();
+        } catch (IOException e) {
+            return full;
         }
     }
 

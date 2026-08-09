@@ -40,13 +40,22 @@ public class PhotoController {
         return ResponseEntity.ok(photoService.listGroupedByDate(userId, folderPassword));
     }
 
+    // maxDimension: grid thumbnails (mobile/web/TV galleries) request e.g. ?maxDimension=400
+    // instead of downloading the full original just to shrink it into a ~100dp cell — the
+    // dominant cost for a grid of these was always network transfer of the full file, not
+    // server-side work, so this isn't cached server-side (see CacheConfig's "raw photo bytes
+    // are never cached" policy — this app runs with a small heap, and it already recomputes
+    // the un-scaled content on every request the same way).
     @GetMapping("/{id}/content")
     public ResponseEntity<byte[]> getContent(
             @RequestHeader("X-User-Id") Long userId,
             @RequestHeader("X-Folder-Password") String folderPassword,
-            @PathVariable Long id) {
-        byte[] content = photoService.getPhotoContent(userId, id, folderPassword);
-        String contentType = photoService.getContentType(userId, id);
+            @PathVariable Long id,
+            @RequestParam(required = false) Integer maxDimension) {
+        byte[] content = maxDimension != null
+                ? photoService.getPhotoThumbnail(userId, id, folderPassword, maxDimension)
+                : photoService.getPhotoContent(userId, id, folderPassword);
+        String contentType = maxDimension != null ? MediaType.IMAGE_JPEG_VALUE : photoService.getContentType(userId, id);
         // private: browser may cache, proxies must not — photo is user-specific and auth-gated
         return ResponseEntity.ok()
                 .contentType(MediaType.parseMediaType(contentType))
