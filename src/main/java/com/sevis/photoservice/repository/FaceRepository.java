@@ -15,9 +15,5 @@ public interface FaceRepository extends JpaRepository<Face, Long> {
      *  exemplar set FaceService matches new faces against (see assignPerson). */
     List<Face> findByUserIdAndPersonIdIsNotNull(Long userId);
 
-    /** Every face row for this user regardless of clustering state — used to find
-     *  which photos already have *some* detection result recorded, for backfillFaces(). */
-    List<Face> findByUserId(Long userId);
-
     void deleteByPhotoId(Long photoId);
 }

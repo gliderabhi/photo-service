@@ -6,6 +6,7 @@ import com.sevis.photoservice.dto.response.FaceResponse;
 import com.sevis.photoservice.dto.response.PersonResponse;
 import com.sevis.photoservice.dto.response.PhotoResponse;
 import com.sevis.photoservice.model.Face;
+import com.sevis.photoservice.model.FaceScanStatus;
 import com.sevis.photoservice.model.Person;
 import com.sevis.photoservice.model.Photo;
 import com.sevis.photoservice.repository.FaceRepository;
@@ -19,7 +20,6 @@ import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.LinkedMultiValueMap;
@@ -75,63 +75,70 @@ public class FaceService {
     @Value("${face.service.url}")
     private String faceServiceUrl;
 
-    @Async("faceDetectionExecutor")
-    public void detectAndStoreAsync(Long userId, Long photoId, byte[] imageBytes, String originalFilename) {
-        detectAndStoreSync(userId, photoId, imageBytes, originalFilename);
-    }
-
-    // Synchronous core, reused by both the per-upload @Async path above and
-    // PhotoService.backfillFaces() below (itself already running on its own
-    // background thread, so this doesn't need its own @Async wrapper — a nested
-    // one would just queue onto the same small executor pool for no benefit).
-    // Reloads exemplars fresh on every call rather than sharing a running set
-    // across a whole backfill batch — one extra query per photo, negligible at
+    // Called synchronously from PhotoService#scanFaceBatch — small, bounded batches
+    // (see that method), so this no longer needs its own @Async wrapper the way the
+    // old per-upload trigger did; the caller controls how much work happens per call.
+    // Owns [photo]'s faceScanStatus bookkeeping directly (not the caller) so every
+    // exit path — success, zero faces found, or a real failure — leaves the photo in
+    // a terminal-for-now state and PhotoService#scanFaceBatch never re-picks it
+    // within the same run. Reloads exemplars fresh on every call rather than sharing
+    // a running set across a whole batch — one extra query per photo, negligible at
     // a personal-library scale, and far simpler than threading shared mutable
     // clustering state between two services.
-    public void detectAndStoreSync(Long userId, Long photoId, byte[] imageBytes, String originalFilename) {
+    public void detectAndStoreSync(Photo photo, byte[] imageBytes) {
+        Long userId = photo.getUserId();
+        Long photoId = photo.getId();
         try {
-            FaceServiceDetectResponse detection = callFaceService(imageBytes, originalFilename);
-            if (detection == null || detection.getFaces() == null || detection.getFaces().isEmpty()) return;
+            FaceServiceDetectResponse detection = callFaceService(imageBytes, photo.getOriginalFilename());
+            if (detection != null && detection.getFaces() != null && !detection.getFaces().isEmpty()) {
+                // Every existing exemplar for this user, grouped by person and capped
+                // per person — loaded once per photo (not once per face) and appended
+                // to in-memory as faces in *this* photo get assigned, so multiple faces
+                // of the same person within one photo still cluster together correctly.
+                Map<Long, List<double[]>> exemplars = loadExemplars(userId);
 
-            // Every existing exemplar for this user, grouped by person and capped
-            // per person — loaded once per photo (not once per face) and appended
-            // to in-memory as faces in *this* photo get assigned, so multiple faces
-            // of the same person within one photo still cluster together correctly.
-            Map<Long, List<double[]>> exemplars = loadExemplars(userId);
+                for (FaceServiceDetectResponse.DetectedFace detected : detection.getFaces()) {
+                    double[] embedding = detected.getEmbedding().stream().mapToDouble(Double::doubleValue).toArray();
 
-            for (FaceServiceDetectResponse.DetectedFace detected : detection.getFaces()) {
-                double[] embedding = detected.getEmbedding().stream().mapToDouble(Double::doubleValue).toArray();
+                    Face face = new Face();
+                    face.setUserId(userId);
+                    face.setPhotoId(photoId);
+                    face.setBoxTop(detected.getBox().getTop() / (double) detection.getImageHeight());
+                    face.setBoxBottom(detected.getBox().getBottom() / (double) detection.getImageHeight());
+                    face.setBoxLeft(detected.getBox().getLeft() / (double) detection.getImageWidth());
+                    face.setBoxRight(detected.getBox().getRight() / (double) detection.getImageWidth());
+                    face.setEmbedding(joinEmbedding(embedding));
 
-                Face face = new Face();
-                face.setUserId(userId);
-                face.setPhotoId(photoId);
-                face.setBoxTop(detected.getBox().getTop() / (double) detection.getImageHeight());
-                face.setBoxBottom(detected.getBox().getBottom() / (double) detection.getImageHeight());
-                face.setBoxLeft(detected.getBox().getLeft() / (double) detection.getImageWidth());
-                face.setBoxRight(detected.getBox().getRight() / (double) detection.getImageWidth());
-                face.setEmbedding(joinEmbedding(embedding));
+                    Person person = assignPerson(userId, embedding, exemplars);
+                    face.setPersonId(person.getId());
+                    faceRepository.save(face);
 
-                Person person = assignPerson(userId, embedding, exemplars);
-                face.setPersonId(person.getId());
-                faceRepository.save(face);
-
-                if (person.getCoverFaceId() == null) {
-                    person.setCoverFaceId(face.getId());
-                    personRepository.save(person);
+                    if (person.getCoverFaceId() == null) {
+                        person.setCoverFaceId(face.getId());
+                        personRepository.save(person);
+                    }
                 }
             }
+            photo.setFaceScanStatus(FaceScanStatus.DONE);
+            photo.setFaceScanError(null);
+            photoRepository.save(photo);
         } catch (Exception e) {
-            // Best-effort: a face-service outage or a bad image must never surface
-            // as an upload failure to the user — the photo itself already saved fine.
+            // Best-effort: a face-service outage or a bad image must never surface as
+            // an upload/sync failure to the user — the photo itself already saved fine.
+            // FAILED (with the attempt count bumped) rather than leaving it PENDING, so
+            // PhotoService#scanFaceBatch's attempt cap can eventually stop retrying a
+            // permanently-broken image instead of re-fetching+re-decrypting it forever.
+            photo.setFaceScanStatus(FaceScanStatus.FAILED);
+            photo.setFaceScanError(truncate(e.getMessage(), 500));
+            photo.setFaceScanAttempts(photo.getFaceScanAttempts() + 1);
+            photoRepository.save(photo);
             log.warn("Face detection failed for photo {}: {}", photoId, e.getMessage());
         }
     }
 
-    /** Photo ids that already have at least one detection attempt recorded for this
-     *  user — PhotoService.backfillFaces() skips these so re-running the backfill
-     *  after new photos arrive doesn't re-scan everything from scratch. */
-    public java.util.Set<Long> photoIdsWithFaces(Long userId) {
-        return faceRepository.findByUserId(userId).stream().map(Face::getPhotoId).collect(java.util.stream.Collectors.toSet());
+    private static String truncate(String message, int maxLength) {
+        if (message == null) return null;
+        return message.length() <= maxLength ? message : message.substring(0, maxLength);
     }
 
     private Map<Long, List<double[]>> loadExemplars(Long userId) {
@@ -159,7 +166,7 @@ public class FaceService {
                 faceServiceUrl + "/detect", new HttpEntity<>(body, headers), FaceServiceDetectResponse.class);
     }
 
-    // Not @Transactional: this is called from detectAndStoreAsync in the same
+    // Not @Transactional: this is called from detectAndStoreSync in the same
     // class, so a self-invoked annotation would silently no-op (same proxy
     // caveat as PhotoService's @Cacheable self-injection). Each repository
     // save() below is already transactional on its own; a non-atomic

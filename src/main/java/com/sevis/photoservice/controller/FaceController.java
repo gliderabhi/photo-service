@@ -2,6 +2,7 @@ package com.sevis.photoservice.controller;
 
 import com.sevis.photoservice.dto.request.RenamePersonRequest;
 import com.sevis.photoservice.dto.response.FaceResponse;
+import com.sevis.photoservice.dto.response.FaceScanBatchResponse;
 import com.sevis.photoservice.dto.response.PersonResponse;
 import com.sevis.photoservice.dto.response.PhotoResponse;
 import com.sevis.photoservice.service.FaceService;
@@ -11,7 +12,6 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
-import java.util.Map;
 
 /**
  * Read side of server-side face detection (see FaceService for the write
@@ -54,14 +54,15 @@ public class FaceController {
         return ResponseEntity.ok(faceService.renamePerson(userId, personId, request));
     }
 
-    // Fire-and-forget: runs on photo-service's own background executor (see
-    // PhotoService#backfillFaces) and can take a while for a large library, so this
-    // returns immediately rather than making the caller wait for the whole scan.
-    @PostMapping("/faces/backfill")
-    public ResponseEntity<Map<String, String>> backfillFaces(
+    // Synchronous, bounded batch — see PhotoService#scanFaceBatch. Meant to be
+    // called repeatedly (the client's periodic auto-upload cycle on both platforms,
+    // or SettingsScreen's manual "Scan now") rather than once for an entire library;
+    // [remaining] tells the caller whether another call would still find work to do.
+    @PostMapping("/faces/scan")
+    public ResponseEntity<FaceScanBatchResponse> scanFaces(
             @RequestHeader("X-User-Id") Long userId,
-            @RequestHeader("X-Folder-Password") String folderPassword) {
-        photoService.backfillFaces(userId, folderPassword);
-        return ResponseEntity.accepted().body(Map.of("message", "Face scan started in the background"));
+            @RequestHeader("X-Folder-Password") String folderPassword,
+            @RequestParam(defaultValue = "10") int limit) {
+        return ResponseEntity.ok(photoService.scanFaceBatch(userId, folderPassword, limit));
     }
 }

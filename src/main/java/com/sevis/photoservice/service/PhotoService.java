@@ -1,7 +1,9 @@
 package com.sevis.photoservice.service;
 
+import com.sevis.photoservice.dto.response.FaceScanBatchResponse;
 import com.sevis.photoservice.dto.response.PhotoResponse;
 import com.sevis.photoservice.dto.response.PhotosByDateResponse;
+import com.sevis.photoservice.model.FaceScanStatus;
 import com.sevis.photoservice.model.Photo;
 import com.sevis.photoservice.model.PhotoFolder;
 import com.sevis.photoservice.repository.PhotoAlbumRepository;
@@ -14,7 +16,6 @@ import org.springframework.cache.annotation.Cacheable;
 import org.springframework.cache.annotation.Caching;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.http.HttpStatus;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
@@ -101,14 +102,16 @@ public class PhotoService {
         photo.setContentType(file.getContentType());
         photo.setFileSize(file.getSize());
         photo.setContentHash(hash);
+        // faceScanStatus defaults to PENDING — detection is intentionally *not*
+        // triggered here anymore (see scanFaceBatch() below). It used to run
+        // fire-and-forget right at this point, against the plaintext bytes still in
+        // hand — the only point they exist outside the encrypted-at-rest file — but
+        // that coupled upload's request path to face-service's availability/latency
+        // for no real benefit, and made every upload path (this one, auto-upload,
+        // any future one) responsible for remembering to call it. Decoupled instead:
+        // the client calls scanFaceBatch() periodically (see both platforms'
+        // AutoUpload), which re-decrypts a small batch of PENDING/FAILED photos itself.
         photoRepository.save(photo);
-
-        // Fire-and-forget: face detection runs on face-service against the
-        // plaintext bytes still in hand here — this is the only point they
-        // exist outside the encrypted-at-rest file, since they're about to go
-        // out of scope. Runs async so a slow/unavailable face-service never
-        // delays the upload response.
-        faceService.detectAndStoreAsync(userId, photo.getId(), rawBytes, originalName);
 
         return toResponse(photo);
     }
@@ -201,37 +204,54 @@ public class PhotoService {
         }
     }
 
+    // Retry cap for FAILED photos in scanFaceBatch() — PENDING photos (first attempt
+    // ever) have no cap, only repeat attempts after a failure do.
+    private static final int MAX_FACE_SCAN_ATTEMPTS = 3;
+
     /**
-     * One-time (well, re-runnable) catch-up for photos uploaded before server-side
-     * face detection existed, or from any period face-service was down — detection
-     * normally only ever runs once, at upload time (see upload() above), so nothing
-     * retroactively scans photos that predate it. Runs on the same small background
-     * executor uploads use, sequentially (not fanned out per-photo), so it never
-     * competes with — or gets starved by — live upload traffic, and a personal
-     * library's worth of photos finishes in a reasonable time without needing its
-     * own dedicated thread pool.
+     * Scans up to [limit] of this user's not-yet-scanned (or previously failed, under
+     * the attempt cap) photos, synchronously within this call — small, bounded
+     * batches instead of the old fire-and-forget whole-library backfill, so it's
+     * cheap to call repeatedly from the client's own periodic sync cycle (see both
+     * platforms' AutoUpload) without ever blocking upload() itself, which no longer
+     * triggers detection at all (see upload() above). Each photo's faceScanStatus is
+     * persisted as it's processed (see FaceService#detectAndStoreSync), so a photo
+     * already scanned — successfully or not, up to the attempt cap — is never
+     * re-picked by a later call.
      */
-    @Async("faceDetectionExecutor")
-    public void backfillFaces(Long userId, String folderPassword) {
+    public FaceScanBatchResponse scanFaceBatch(Long userId, String folderPassword, int limit) {
         PhotoFolder folder = folderService.verifyAndGetFolder(userId, folderPassword);
-        java.util.Set<Long> alreadyScanned = faceService.photoIdsWithFaces(userId);
-        List<Photo> photos = photoRepository.findByUserIdOrderByUploadedAtDesc(userId);
+
+        List<Photo> batch = new java.util.ArrayList<>(
+                photoRepository.findByUserIdAndFaceScanStatusOrderByUploadedAtDesc(
+                        userId, FaceScanStatus.PENDING, org.springframework.data.domain.PageRequest.of(0, limit)));
+        if (batch.size() < limit) {
+            batch.addAll(photoRepository.findByUserIdAndFaceScanStatusAndFaceScanAttemptsLessThanOrderByUploadedAtDesc(
+                    userId, FaceScanStatus.FAILED, MAX_FACE_SCAN_ATTEMPTS,
+                    org.springframework.data.domain.PageRequest.of(0, limit - batch.size())));
+        }
 
         int scanned = 0;
-        for (Photo photo : photos) {
-            if (alreadyScanned.contains(photo.getId())) continue;
+        for (Photo photo : batch) {
             try {
                 Path filePath = Path.of(folder.getFolderPath(), photo.getStoredFilename());
                 byte[] encrypted = Files.readAllBytes(filePath);
                 byte[] plain = encryptionService.decrypt(encrypted, folderPassword, folder.getEncryptionSalt(), folder.getPbkdf2Iterations());
-                faceService.detectAndStoreSync(userId, photo.getId(), plain, photo.getOriginalFilename());
+                faceService.detectAndStoreSync(photo, plain);
                 scanned++;
             } catch (Exception e) {
-                log.warn("Face backfill failed for photo {}: {}", photo.getId(), e.getMessage());
+                photo.setFaceScanStatus(FaceScanStatus.FAILED);
+                photo.setFaceScanError(e.getMessage());
+                photo.setFaceScanAttempts(photo.getFaceScanAttempts() + 1);
+                photoRepository.save(photo);
+                log.warn("Face scan failed for photo {} (couldn't read/decrypt): {}", photo.getId(), e.getMessage());
             }
         }
-        log.info("Face backfill finished for user {}: scanned {} new photo(s) ({} already had results)",
-                userId, scanned, alreadyScanned.size());
+
+        long remaining = photoRepository.countByUserIdAndFaceScanStatus(userId, FaceScanStatus.PENDING)
+                + photoRepository.countByUserIdAndFaceScanStatus(userId, FaceScanStatus.FAILED);
+        log.info("Face scan batch for user {}: scanned {}, {} remaining", userId, scanned, remaining);
+        return FaceScanBatchResponse.builder().scanned(scanned).remaining(remaining).build();
     }
 
     public String getContentType(Long userId, Long photoId) {

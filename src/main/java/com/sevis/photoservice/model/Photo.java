@@ -41,6 +41,22 @@ public class Photo {
     @Column(nullable = false)
     private LocalDateTime uploadedAt;
 
+    /** See FaceScanStatus — detection is decoupled from upload, so every new photo
+     *  starts PENDING and PhotoService#scanFaceBatch picks it up later. */
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 20)
+    private FaceScanStatus faceScanStatus = FaceScanStatus.PENDING;
+
+    /** Truncated exception message from the last failed scan attempt — null once a
+     *  scan succeeds. Purely diagnostic, not shown to the user. */
+    @Column(length = 500)
+    private String faceScanError;
+
+    /** Capped in PhotoService#scanFaceBatch so a permanently-broken image (corrupt
+     *  file, unsupported format) doesn't get retried forever. */
+    @Column(nullable = false)
+    private Integer faceScanAttempts = 0;
+
     @PrePersist
     protected void onCreate() {
         this.uploadedAt = LocalDateTime.now();
