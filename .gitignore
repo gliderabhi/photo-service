@@ -9,3 +9,4 @@ build/
 *.ipr
 out/
 .DS_Store
+*.bak-*
